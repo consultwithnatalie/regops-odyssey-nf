@@ -1,0 +1,1651 @@
+streamlit>=1.42,<2
+pandas>=2.2,<3
+plotly>=5.24,<7
+
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from datetime import date
+from html import escape
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+import streamlit.components.v1 as components
+
+from coach import external_ai_feedback, rubric_feedback, voice_coach_html
+from content import COACH_RUBRICS, CURRICULUM, GLOSSARY, PRICING, QUIZ, SCENARIO, SQL_CHALLENGES
+from database import dashboard_data, execute_select, move_task, read_table, reset_demo, save_lead
+
+APP_DIR = Path(__file__).resolve().parent
+
+st.set_page_config(
+    page_title="RegOps Odyssey | Product Consulting Academy",
+    page_icon="🧭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+<style>
+.block-container {padding-top: 1.1rem; padding-bottom: 3rem; max-width: 1500px;}
+.hero {background:linear-gradient(135deg,#07172d 0%,#123b63 62%,#0f766e 100%); color:white; padding:34px; border-radius:22px; margin-bottom:20px; box-shadow:0 12px 32px rgba(7,23,45,.18)}
+.hero h1 {font-size:3rem; margin:0 0 8px 0; line-height:1.05;}
+.hero p {font-size:1.08rem; max-width:900px; color:#e8f3ff;}
+.eyebrow {font-size:.8rem; text-transform:uppercase; letter-spacing:.14em; color:#8de6d9; font-weight:800;}
+.card {background:white; border:1px solid #dfe8f2; border-radius:16px; padding:18px; height:100%; box-shadow:0 5px 18px rgba(16,35,63,.06)}
+.darkcard {background:#0c213e; color:white; border-radius:16px; padding:18px; height:100%;}
+.darkcard p {color:#cbd8e8;}
+.badge {display:inline-block; padding:5px 10px; border-radius:999px; background:#dff7f3; color:#0f5b55; font-size:.78rem; font-weight:800; margin-right:5px; margin-bottom:5px;}
+.mission {border-left:5px solid #2dd4bf; background:#f5fbfa; padding:14px 16px; border-radius:8px; margin:8px 0 14px 0;}
+.warning {border-left:5px solid #f1b84b; background:#fff8e8; padding:14px 16px; border-radius:8px;}
+.success {border-left:5px solid #38a169; background:#effaf3; padding:14px 16px; border-radius:8px;}
+.metric-label {font-size:.82rem; color:#52677f; text-transform:uppercase; letter-spacing:.06em; font-weight:700;}
+.small {font-size:.86rem;color:#5a6d84;}
+.stButton>button {border-radius:10px; font-weight:700;}
+[data-testid="stSidebar"] {background:#07172d;}
+[data-testid="stSidebar"] * {color:#eef6ff;}
+[data-testid="stSidebar"] .stSelectbox label {color:#eef6ff;}
+hr {border:none;border-top:1px solid #dfe8f2;margin:20px 0;}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+if "completed" not in st.session_state:
+    st.session_state.completed = set()
+if "quiz_score" not in st.session_state:
+    st.session_state.quiz_score = None
+if "lab_notes" not in st.session_state:
+    st.session_state.lab_notes = {}
+
+
+def mark_complete(module_id: str) -> None:
+    st.session_state.completed.add(module_id)
+
+
+def progress_value() -> float:
+    return len(st.session_state.completed) / len(CURRICULUM)
+
+
+def safe_email(value: str) -> bool:
+    return bool(re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value.strip()))
+
+
+def page_header(title: str, subtitle: str, eyebrow: str = "RegOps Odyssey") -> None:
+    st.markdown(
+        f"""<div class="hero"><div class="eyebrow">{escape(eyebrow)}</div><h1>{escape(title)}</h1><p>{escape(subtitle)}</p></div>""",
+        unsafe_allow_html=True,
+    )
+
+
+def stage_route(client_type: str, product: str, risk: str, pep: bool, sanctions: bool) -> tuple[pd.DataFrame, list[str], str]:
+    required_docs = ["Proof of Legal Existence", "Registered Address Evidence", "Authorized Signatory List", "Tax Information"]
+    if client_type in {"Private Company", "Partnership", "Fund", "Trust"}:
+        required_docs += ["Ownership and Control Evidence", "Ultimate Beneficial Owner Identification"]
+    if client_type == "Trust":
+        required_docs += ["Trust Deed", "Settlor / Trustee / Beneficiary Details"]
+    if product in {"Institutional Investment Account", "Treasury & FX"}:
+        required_docs += ["Source of Funds Evidence", "Investment Purpose and Expected Activity"]
+    if risk == "High" or pep or sanctions:
+        required_docs += ["Enhanced Due Diligence Rationale", "Source of Wealth Evidence", "Senior Approval Record"]
+
+    stages = [
+        (1, "Request Intake", "Client Service", "Capture purpose, client type, products, jurisdictions and contacts."),
+        (2, "Operations Validation", "Operations", "Validate completeness, duplicates, routing and service eligibility."),
+        (3, "KYC Collection", "KYC", "Collect required client, party, ownership and evidence information."),
+        (4, "KYC Verification", "KYC", "Verify evidence, ownership, identity and screening results."),
+    ]
+    if risk == "High" or pep or sanctions:
+        stages.append((5, "Compliance Review", "Compliance + Head of Compliance", "Resolve alerts, complete EDD and record authorized approval."))
+    else:
+        stages.append((5, "Compliance Rules Check", "Compliance", "Confirm standard policy requirements are satisfied."))
+    stages += [
+        (6, "Account Setup", "Operations", "Create account and product records after all blocking controls pass."),
+        (7, "Client Confirmation", "Client Service", "Issue confirmation, archive evidence and schedule ongoing review."),
+    ]
+    outcome = "Block and escalate" if sanctions else "Enhanced review required" if (risk == "High" or pep) else "Standard route"
+    return pd.DataFrame(stages, columns=["Stage", "Name", "Owner", "Control / Outcome"]), sorted(set(required_docs)), outcome
+
+
+with st.sidebar:
+    st.markdown("## 🧭 RegOps Odyssey")
+    st.caption("Financial-services product consulting, BI, data, configuration and delivery labs")
+    st.progress(progress_value(), text=f"Learning progress: {len(st.session_state.completed)}/{len(CURRICULUM)} missions")
+    page = st.radio(
+        "Navigate",
+        [
+            "Home",
+            "Mission Map",
+            "KYC Journey Lab",
+            "SQL Data Vault",
+            "BI Control Tower",
+            "Integration Bridge",
+            "Agile Mission Control",
+            "Configuration Forge",
+            "Quality & Gap Analysis",
+            "Product Consultant Studio",
+            "Odyssey AI Coach",
+            "Capstone & Completion",
+            "Revenue Launchpad",
+            "Glossary & Resources",
+        ],
+        label_visibility="collapsed",
+    )
+    st.divider()
+    st.caption("Fictional learning data only. Not affiliated with or endorsed by Fenergo or Kaha Consulting.")
+
+
+if page == "Home":
+    page_header(
+        "RegOps Odyssey",
+        "A marketable, adventure-based learning system where aspiring product consultants build real evidence in Agile delivery, financial services onboarding, KYC/AML, SQL, BI, integrations, SaaS configuration, testing, demonstrations and stakeholder leadership.",
+        "Final product brand • Free-to-run training platform",
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    for col, value, label in [
+        (c1, "10", "Skill missions"),
+        (c2, "22–27", "Guided learning hours"),
+        (c3, "7", "Hands-on workspaces"),
+        (c4, "1", "Portfolio capstone"),
+    ]:
+        with col:
+            st.markdown(f"<div class='card'><div style='font-size:2rem;font-weight:900'>{value}</div><div class='metric-label'>{label}</div></div>", unsafe_allow_html=True)
+
+    st.markdown("### What learners actually do")
+    cols = st.columns(3)
+    cards = [
+        ("🧩 Configure", "Build an onboarding route, evidence rules, high-risk approvals, reusable components and tenant working practices."),
+        ("🗃️ Query", "Use SQL against an original client, product, document, journey, task, integration and transaction database."),
+        ("📊 Explain", "Read a BI control tower, find root causes and present executive recommendations."),
+        ("🔌 Integrate", "Map CRM data into a CLM-style case, validate JSON and design exception handling."),
+        ("🧪 Prove", "Run negative tests, edge cases, spikes, fit-gap analysis and release-readiness checks."),
+        ("🎤 Lead", "Gather requirements, control scope, demonstrate solutions, support change and transfer knowledge."),
+    ]
+    for i, (title, text) in enumerate(cards):
+        with cols[i % 3]:
+            st.markdown(f"<div class='card'><h3>{title}</h3><p>{text}</p></div>", unsafe_allow_html=True)
+
+    st.markdown("### Final expedition")
+    st.markdown(
+        f"""<div class='mission'><b>{SCENARIO['program']}</b><br>{SCENARIO['problem']}<br><br><b>Client:</b> {SCENARIO['client']}</div>""",
+        unsafe_allow_html=True,
+    )
+    st.write("The learner finishes with a journey design, relational data model, rules, integration mapping, Agile backlog, test evidence, BI dashboard interpretation, demo script and release recommendation.")
+
+    st.markdown("### Fenergo and Kaha foundational lens")
+    st.write(
+        "The curriculum uses public industry context to teach the kind of lifecycle thinking associated with Fenergo-enabled programs: onboarding, KYC/AML, ongoing review, rules, evidence, integrations and operational control. It also reflects Kaha Consulting’s publicly described implementation approach across readiness, blueprinting, testing and deployment. Every lab, screen, rule and scenario in RegOps Odyssey is original and fictional."
+    )
+
+    st.markdown("### Why this can earn revenue")
+    st.write(
+        "The free tier demonstrates value and captures interest. Paid access can unlock the full learning path, reusable templates, interview simulations, portfolio review, guided cohorts and team licensing. The Revenue Launchpad contains the working offer structure and configurable checkout calls to action."
+    )
+
+elif page == "Mission Map":
+    page_header("Mission Map", "Each segment is time-boxed to 1–2 or 2–3 hours and ends with proof a learner can show, discuss or add to a portfolio.")
+    for mission in CURRICULUM:
+        complete = mission["id"] in st.session_state.completed
+        with st.expander(f"{'✅' if complete else '🧭'} {mission['id']} — {mission['title']} · {mission['duration']} · {mission['level']}"):
+            st.markdown(f"**Mission:** {mission['mission']}")
+            st.markdown(" ".join(f"<span class='badge'>{escape(skill)}</span>" for skill in mission["skills"]), unsafe_allow_html=True)
+            for segment, text in mission["segments"]:
+                st.markdown(f"**{segment}:** {text}")
+            st.markdown(f"**Portfolio evidence:** {mission['deliverable']}")
+            notes = st.text_area("Mission notes", key=f"notes_{mission['id']}", placeholder="Capture decisions, questions, evidence and next actions.")
+            if notes:
+                st.session_state.lab_notes[mission["id"]] = notes
+            if st.button("Mark mission complete", key=f"complete_{mission['id']}", disabled=complete):
+                mark_complete(mission["id"])
+                st.rerun()
+
+elif page == "KYC Journey Lab":
+    page_header("KYC Journey Lab", "Configure a client- and product-onboarding route using original, fictional data and risk-based controls.", "Mission M03 + M07")
+    left, right = st.columns([1, 1.35])
+    with left:
+        client_type = st.selectbox("Client type", ["Private Company", "Listed Company", "Partnership", "Fund", "Trust", "Bank", "Fintech"])
+        product = st.selectbox("Product", ["Institutional Investment Account", "Current Account", "Secured Loan", "Unsecured Loan", "Treasury & FX", "Merchant Settlement"])
+        jurisdiction = st.selectbox("Primary jurisdiction", ["United States", "Ireland", "United Kingdom", "Luxembourg", "South Africa", "Singapore", "Norway", "Egypt"])
+        risk = st.select_slider("Initial risk rating", options=["Low", "Medium", "High"], value="Medium")
+        pep = st.checkbox("Potential PEP connection")
+        sanctions = st.checkbox("Potential sanctions match")
+        st.caption("A potential match is an alert for investigation—not a conclusion about a person or entity.")
+    stages, docs, outcome = stage_route(client_type, product, risk, pep, sanctions)
+    with right:
+        st.metric("Routing result", outcome)
+        st.dataframe(stages, use_container_width=True, hide_index=True)
+    st.markdown("### Dynamic evidence checklist")
+    doc_df = pd.DataFrame({"Required evidence": docs, "Purpose": ["Support identity, ownership, risk, product or approval requirements." for _ in docs]})
+    st.dataframe(doc_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### Rule-design challenge")
+    st.code(
+        "IF Risk = High OR PEP Alert = True\nTHEN create Compliance Review task; require EDD evidence; block Account Setup until authorized approval\nELSE continue standard compliance rules check",
+        language="text",
+    )
+    rationale = st.text_area("Explain your configuration decision", placeholder="State the trigger, evidence, decision owner, blocking control, exception path and intended business outcome.")
+    if st.button("Evaluate rationale"):
+        result = rubric_feedback("KYC/AML Rationale", rationale)
+        st.metric("Consulting score", f"{result['score']}/100", result["level"])
+        st.write(result["summary"])
+        for item in result["next_moves"]:
+            st.write("•", item)
+    if st.button("Complete M03 KYC & AML Investigation"):
+        mark_complete("M03")
+        st.success("Mission M03 recorded as complete.")
+
+elif page == "SQL Data Vault":
+    page_header("SQL Data Vault", "Run read-only SQL against the fictional RegOps Odyssey database and convert results into business decisions.", "Mission M04")
+    with st.expander("Database schema", expanded=False):
+        schema = pd.DataFrame(
+            [
+                ("clients", "Client type, country, region, risk, screening flags, owner and review date"),
+                ("products", "Product family and risk weight"),
+                ("client_products", "Many-to-many client/product relationship"),
+                ("documents", "Evidence type, status, verification and expiry"),
+                ("journeys", "Stage, SLA, age, high-risk gate, reopen count and status"),
+                ("tasks", "Sprint, owner, work type, status, story points and due date"),
+                ("transactions", "Amount, country, channel, date and training alert flag"),
+                ("integrations", "Route, object, volume, errors and latency"),
+                ("requirements", "Persona, acceptance criteria, priority, status and owner"),
+            ],
+            columns=["Table", "Contains"],
+        )
+        st.dataframe(schema, use_container_width=True, hide_index=True)
+
+    challenge_title = st.selectbox("Choose a challenge", [c["title"] for c in SQL_CHALLENGES])
+    challenge = next(c for c in SQL_CHALLENGES if c["title"] == challenge_title)
+    st.markdown(f"<div class='mission'><b>Challenge:</b> {challenge['prompt']}<br><span class='small'>Hint: {challenge['hint']}</span></div>", unsafe_allow_html=True)
+    query = st.text_area("SQL editor", value=challenge["starter"], height=220)
+    if st.button("Run query", type="primary"):
+        try:
+            result = execute_select(query)
+            st.success(f"Query returned {len(result):,} rows.")
+            st.dataframe(result, use_container_width=True, hide_index=True)
+            st.download_button("Download query result", result.to_csv(index=False).encode("utf-8"), "regops_sql_result.csv", "text/csv")
+        except Exception as exc:
+            st.error(str(exc))
+    interpretation = st.text_area("Business interpretation", placeholder="What happened, why it matters, what should be investigated, and who should act?")
+    if st.button("Score interpretation"):
+        result = rubric_feedback("Solution Design", interpretation)
+        st.metric("Interpretation score", f"{result['score']}/100", result["level"])
+        st.write(result["summary"])
+        for move in result["next_moves"]:
+            st.write("•", move)
+    if st.button("Complete M04 SQL Data Vault"):
+        mark_complete("M04")
+        st.success("Mission M04 recorded as complete.")
+
+elif page == "BI Control Tower":
+    page_header("BI Control Tower", "Filter operational data, identify the constraint behind onboarding delays and build an executive storyline.", "Mission M05")
+    data = dashboard_data()
+    journeys = data["journeys"].copy()
+    clients = data["clients"].copy()
+    documents = data["documents"].copy()
+    tasks = data["tasks"].copy()
+    integrations = data["integrations"].copy()
+
+    f1, f2, f3 = st.columns(3)
+    regions = f1.multiselect("Region", sorted(clients["region"].unique()), default=sorted(clients["region"].unique()))
+    risks = f2.multiselect("Risk", ["Low", "Medium", "High"], default=["Low", "Medium", "High"])
+    statuses = f3.multiselect("Journey status", sorted(journeys["status"].unique()), default=sorted(journeys["status"].unique()))
+    filtered = journeys[journeys["region"].isin(regions) & journeys["risk_rating"].isin(risks) & journeys["status"].isin(statuses)].copy()
+    filtered["sla_exposure"] = filtered["days_open"] - filtered["sla_days"]
+    filtered_clients = set(filtered["client_id"].tolist())
+    filtered_docs = documents[documents["client_id"].isin(filtered_clients)]
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Open journeys", int((filtered["status"] == "Open").sum()))
+    k2.metric("High risk", int((filtered["risk_rating"] == "High").sum()))
+    k3.metric("Over SLA", int((filtered["sla_exposure"] > 0).sum()))
+    k4.metric("Evidence gaps", int(filtered_docs["status"].isin(["Missing", "Expired"]).sum()))
+    failure_rate = 100 * integrations["error_count"].sum() / max(1, integrations["records_processed"].sum())
+    k5.metric("Integration errors", f"{failure_rate:.1f}%")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(
+            filtered.groupby(["region", "risk_rating"], as_index=False).size(),
+            x="region", y="size", color="risk_rating", barmode="stack",
+            title="Journey population by region and risk",
+            labels={"size": "Journeys", "region": "Region", "risk_rating": "Risk"},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        stage_age = filtered.groupby("current_stage", as_index=False)["days_open"].mean().sort_values("days_open", ascending=False)
+        fig = px.bar(stage_age, x="days_open", y="current_stage", orientation="h", title="Average age by current stage", labels={"days_open": "Average days open", "current_stage": "Stage"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        task_summary = tasks.groupby("status", as_index=False)["story_points"].sum()
+        fig = px.pie(task_summary, names="status", values="story_points", hole=.45, title="Story-point distribution")
+        st.plotly_chart(fig, use_container_width=True)
+    with c4:
+        route_summary = integrations.groupby(["source_system", "target_system"], as_index=False).agg(records=("records_processed", "sum"), errors=("error_count", "sum"), latency=("latency_ms", "mean"))
+        route_summary["failure_rate"] = 100 * route_summary["errors"] / route_summary["records"].clip(lower=1)
+        fig = px.scatter(route_summary, x="latency", y="failure_rate", size="records", hover_name="source_system", hover_data=["target_system"], title="Integration reliability map", labels={"latency": "Average latency (ms)", "failure_rate": "Failure rate (%)"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### Executive exception list")
+    exception_view = filtered[(filtered["sla_exposure"] > 0) | (filtered["risk_rating"] == "High")][["client_name", "region", "risk_rating", "current_stage", "days_open", "sla_days", "sla_exposure", "assigned_owner"]].sort_values(["sla_exposure", "days_open"], ascending=False)
+    st.dataframe(exception_view, use_container_width=True, hide_index=True)
+    story = st.text_area("Write the executive storyline", placeholder="Situation: ...\nComplication: ...\nResolution: ...\nDecision requested: ...")
+    if st.button("Evaluate executive storyline"):
+        result = rubric_feedback("Demo Presentation", story)
+        st.metric("Storyline score", f"{result['score']}/100", result["level"])
+        for move in result["next_moves"]:
+            st.write("•", move)
+    if st.button("Complete M05 BI Control Tower"):
+        mark_complete("M05")
+        st.success("Mission M05 recorded as complete.")
+
+elif page == "Integration Bridge":
+    page_header("Integration Bridge", "Map client data across a Dynamics-style CRM, onboarding case, screening service and BI route, then test failures.", "Mission M06")
+    default_payload = {
+        "correlationId": "REG-OD-2026-1042",
+        "source": "Dynamics CRM",
+        "client": {
+            "legalName": "Asteria Global Holdings",
+            "registrationNumber": "IE-884219",
+            "countryCode": "IE",
+            "clientType": "Private Company",
+            "products": ["INVESTMENT_ACCOUNT", "TREASURY_FX"],
+            "riskRating": "High",
+        },
+    }
+    left, right = st.columns([1.1, 1])
+    with left:
+        payload_text = st.text_area("Inbound JSON", json.dumps(default_payload, indent=2), height=330)
+    with right:
+        st.markdown("#### Target field mapping")
+        mapping = pd.DataFrame(
+            [
+                ("client.legalName", "case.client.legal_name", "Required; trim whitespace"),
+                ("client.registrationNumber", "case.client.external_id", "Required; duplicate check"),
+                ("client.countryCode", "case.client.country", "ISO two-letter code"),
+                ("client.clientType", "case.client.type", "Translate to configured enumeration"),
+                ("client.products[]", "case.products[].code", "Validate product code"),
+                ("client.riskRating", "case.risk.initial_rating", "Allowed: Low, Medium, High"),
+                ("correlationId", "case.integration.correlation_id", "Required for traceability"),
+            ],
+            columns=["Source", "Target", "Validation"],
+        )
+        st.dataframe(mapping, use_container_width=True, hide_index=True)
+
+    if st.button("Validate and transform", type="primary"):
+        try:
+            payload = json.loads(payload_text)
+            errors = []
+            client = payload.get("client", {})
+            if not payload.get("correlationId"):
+                errors.append("Missing correlationId")
+            if not client.get("legalName"):
+                errors.append("Missing legalName")
+            if len(client.get("countryCode", "")) != 2:
+                errors.append("countryCode must contain two characters")
+            valid_products = {"INVESTMENT_ACCOUNT", "CURRENT_ACCOUNT", "SECURED_LOAN", "UNSECURED_LOAN", "TREASURY_FX", "MERCHANT_SETTLEMENT"}
+            unknown = [p for p in client.get("products", []) if p not in valid_products]
+            if unknown:
+                errors.append("Unknown product code(s): " + ", ".join(unknown))
+            if client.get("riskRating") not in {"Low", "Medium", "High"}:
+                errors.append("Invalid riskRating")
+
+            transformed = {
+                "case": {
+                    "client": {
+                        "legal_name": client.get("legalName", "").strip(),
+                        "external_id": client.get("registrationNumber"),
+                        "country": client.get("countryCode"),
+                        "type": client.get("clientType"),
+                    },
+                    "products": [{"code": p} for p in client.get("products", [])],
+                    "risk": {"initial_rating": client.get("riskRating")},
+                    "integration": {"correlation_id": payload.get("correlationId"), "source": payload.get("source")},
+                }
+            }
+            if errors:
+                st.error("Validation failed")
+                for err in errors:
+                    st.write("•", err)
+            else:
+                st.success("Payload passed validation and is ready for case creation.")
+                st.json(transformed)
+        except json.JSONDecodeError as exc:
+            st.error(f"Invalid JSON: {exc}")
+
+    st.markdown("### Bridge Collapse challenge")
+    edge = st.selectbox("Failure scenario", ["Duplicate message", "Screening timeout", "Partial client update", "Invalid country code", "Downstream BI outage"])
+    recommendations = {
+        "Duplicate message": "Use an idempotency key or correlation ID, detect the prior successful transaction, and return the existing case result rather than creating a second case.",
+        "Screening timeout": "Place the request in a retryable state, preserve the correlation ID, use bounded retries with backoff, then route to an exception queue with ownership and SLA.",
+        "Partial client update": "Define field-level update rules, protect verified values, record provenance, and reconcile source and target versions before overwriting data.",
+        "Invalid country code": "Reject before case creation, return a field-specific validation message, and monitor recurring source-data defects.",
+        "Downstream BI outage": "Keep the operational transaction independent, queue the event, replay safely after recovery, and reconcile event counts to the source system.",
+    }
+    st.info(recommendations[edge])
+    if st.button("Complete M06 Integration Bridge"):
+        mark_complete("M06")
+        st.success("Mission M06 recorded as complete.")
+
+elif page == "Agile Mission Control":
+    page_header("Agile Mission Control", "Manage a live fictional backlog, move work through delivery and practice scope decisions.", "Mission M01")
+    tasks = read_table("tasks")
+    selected_sprint = st.selectbox("Sprint", sorted(tasks["sprint"].unique()))
+    sprint_tasks = tasks[tasks["sprint"] == selected_sprint]
+    status_order = ["Backlog", "Ready", "In Progress", "Review", "Done"]
+    cols = st.columns(5)
+    for col, status in zip(cols, status_order):
+        with col:
+            subset = sprint_tasks[sprint_tasks["status"] == status]
+            st.markdown(f"#### {status} · {len(subset)}")
+            for _, row in subset.iterrows():
+                st.markdown(
+                    f"<div class='card'><b>#{row['task_id']} {escape(row['title'])}</b><br><span class='small'>{escape(row['owner'])} · {row['story_points']} pts · due {row['due_date']}</span></div>",
+                    unsafe_allow_html=True,
+                )
+    st.divider()
+    m1, m2, m3 = st.columns(3)
+    task_id = m1.selectbox("Work item", sprint_tasks["task_id"].astype(int).tolist(), format_func=lambda x: f"#{x} — {sprint_tasks.loc[sprint_tasks['task_id'] == x, 'title'].iloc[0]}")
+    new_status = m2.selectbox("Move to", status_order)
+    if m3.button("Update board", type="primary"):
+        move_task(int(task_id), new_status)
+        st.success("Work item updated.")
+        st.rerun()
+
+    st.markdown("### Scope Storm")
+    scope_request = st.selectbox("New request arrives mid-sprint", [
+        "Add a new jurisdiction before release",
+        "Change the approved risk model thresholds",
+        "Improve wording on the client confirmation screen",
+        "Add a second screening provider",
+    ])
+    decision = st.radio("Your delivery decision", ["Accept into current sprint", "Swap with an equal-sized item", "Add to backlog", "Raise formal change control"])
+    if st.button("Review scope decision"):
+        high_impact = scope_request in {"Add a new jurisdiction before release", "Change the approved risk model thresholds", "Add a second screening provider"}
+        if high_impact and decision in {"Add to backlog", "Raise formal change control"}:
+            st.success("Strong control: the request affects policy, integrations, testing or release scope and should be assessed before commitment.")
+        elif not high_impact and decision in {"Swap with an equal-sized item", "Add to backlog"}:
+            st.success("Reasonable: a lower-impact change can be traded transparently or scheduled without destabilizing the sprint.")
+        else:
+            st.warning("Explain capacity, dependency, test impact, approval needs and what existing commitment would change.")
+    if st.button("Complete M01 Agile Launch Bay"):
+        mark_complete("M01")
+        st.success("Mission M01 recorded as complete.")
+
+elif page == "Configuration Forge":
+    page_header("Configuration Forge", "Design reusable configuration and protect a shared SaaS tenant from conflicts, brittle rules and uncontrolled releases.", "Mission M07")
+    st.markdown("### Configuration components")
+    components_df = pd.DataFrame(
+        [
+            ("Journey", "Institutional Investment Account", "Stages, entry criteria, exit criteria and exception routes", "Journey-PC-INV-001"),
+            ("Rule", "High-risk approval", "Risk/PEP/sanctions trigger and blocking approval", "Rule-KYC-HR-001"),
+            ("Document set", "Corporate standard evidence", "Reusable data and evidence requirements", "Docs-CORP-STD-001"),
+            ("Data object", "Client party", "Legal entity, ownership, address, tax and risk attributes", "Data-PARTY-001"),
+            ("Integration", "CRM client intake", "Field mapping, validation, idempotency and reconciliation", "Int-CRM-CLM-001"),
+            ("Dashboard event", "Journey stage changed", "Event sent to reporting route with timestamps and ownership", "Evt-JRN-STG-001"),
+        ],
+        columns=["Type", "Component", "Design responsibility", "Naming standard"],
+    )
+    st.dataframe(components_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### Tenant working agreement builder")
+    a, b = st.columns(2)
+    with a:
+        owner = st.text_input("Component owner", "Product Consultant")
+        change_id = st.text_input("Change reference", "ADO-1842")
+        environment = st.selectbox("Environment", ["Development", "Test", "UAT", "Production"])
+    with b:
+        dependency = st.text_input("Known dependencies", "High-risk rule, document set, BI event")
+        promotion = st.selectbox("Promotion method", ["Packaged and versioned", "Manual controlled change", "Automated pipeline"])
+        rollback = st.text_input("Rollback plan", "Restore prior version and replay test pack")
+    agreement = f"Owner: {owner}\nChange: {change_id}\nEnvironment: {environment}\nDependencies: {dependency}\nPromotion: {promotion}\nRollback: {rollback}"
+    st.code(agreement, language="text")
+
+    st.markdown("### Shared Tenant Maze")
+    conflict = st.selectbox("Conflict", ["Two people editing one rule", "Unlabeled duplicate components", "UAT fix made directly in production", "Migration pack missing a dependency"])
+    controls = {
+        "Two people editing one rule": "Assign one change owner, stop parallel edits, record the baseline, coordinate a merge decision, version the component and rerun dependent tests.",
+        "Unlabeled duplicate components": "Apply naming and ownership standards, compare use and dependencies, select the reusable source of truth, retire duplicates through controlled change.",
+        "UAT fix made directly in production": "Record the incident, restore environment alignment, recreate the fix in the source environment, test it, then promote through the approved path.",
+        "Migration pack missing a dependency": "Stop release, compare dependency manifests, add the missing component, rerun deployment and regression checks, and update the release checklist.",
+    }
+    st.info(controls[conflict])
+    if st.button("Complete M07 Configuration Forge"):
+        mark_complete("M07")
+        st.success("Mission M07 recorded as complete.")
+
+elif page == "Quality & Gap Analysis":
+    page_header("Quality & Gap Analysis Cavern", "Test the happy path, negative paths, boundaries, integrations and configuration gaps before approving release.", "Mission M08")
+    st.markdown("### Use-case test designer")
+    test_case = st.selectbox("Scenario", [
+        "Required ownership document is missing",
+        "Potential duplicate client is found",
+        "Ownership changes after KYC verification",
+        "Head of Compliance rejects high-risk onboarding",
+        "Screening service returns multiple possible matches",
+        "Client requests a product unsupported in one jurisdiction",
+    ])
+    expected = st.text_area("Expected system behavior", placeholder="Trigger, status, user message, owner, evidence, downstream impact and exit condition.")
+    if st.button("Assess test design"):
+        keywords = ["status", "task", "owner", "block", "evidence", "message", "audit", "exit"]
+        hits = [k for k in keywords if k in expected.lower()]
+        score = round(100 * len(hits) / len(keywords))
+        st.metric("Test completeness", f"{score}/100")
+        if score >= 75:
+            st.success("The test covers control behavior and operational handling. Add exact data conditions and expected timestamps where relevant.")
+        else:
+            st.warning("A resilient test should state the resulting status, blocking behavior, user task, owner, evidence/audit result, message and exit condition.")
+
+    st.markdown("### Spike and fit-gap register")
+    fit = st.selectbox("Fit assessment", ["Standard configuration", "Configuration extension", "Integration solution", "Process workaround", "Product engineering gap"])
+    option = st.text_area("Option and recommendation", placeholder="Requirement, options considered, outcome, risks, recommendation and follow-up owner.")
+    if st.button("Generate fit-gap record"):
+        record = {
+            "scenario": test_case,
+            "fit_assessment": fit,
+            "recommendation": option,
+            "decision_status": "Proposed",
+            "required_evidence": ["Spike notes", "Configuration/integration impact", "Test evidence", "Stakeholder decision"],
+        }
+        st.json(record)
+    if st.button("Complete M08 Quality & Gap Analysis"):
+        mark_complete("M08")
+        st.success("Mission M08 recorded as complete.")
+
+elif page == "Product Consultant Studio":
+    page_header("Product Consultant Studio", "Practice the full consulting cycle: discovery, analysis, solution design, demonstration, approval, change and knowledge transfer.", "Mission M09")
+    tab1, tab2, tab3, tab4 = st.tabs(["Requirements", "Solution Design", "Demo & Approval", "Change & Knowledge"])
+    with tab1:
+        stakeholder_statement = st.text_area("Raw stakeholder statement", "We need high-risk clients to go through more checks, but we cannot slow down every client.")
+        persona = st.text_input("Primary persona", "Compliance Officer")
+        user_need = st.text_input("Testable need", "Route only qualifying high-risk cases to enhanced review")
+        business_value = st.text_input("Business value", "Maintain stronger controls without adding unnecessary delay to standard cases")
+        acceptance = st.text_area("Acceptance criteria", "1. High-risk, PEP-alert or sanctions-alert cases create an enhanced review task.\n2. Account setup is blocked until authorized approval.\n3. Standard-risk cases do not receive the enhanced-review task.\n4. All decisions retain timestamp, owner and evidence.")
+        if st.button("Build requirement", key="build_req"):
+            st.markdown(
+                f"**User story:** As a {persona}, I need to {user_need.lower()} so that {business_value.lower()}.\n\n**Acceptance criteria**\n{acceptance}"
+            )
+    with tab2:
+        requirements = read_table("requirements")
+        st.dataframe(requirements, use_container_width=True, hide_index=True)
+        selected_req = st.selectbox("Requirement to design", requirements["req_id"].tolist(), format_func=lambda x: requirements.loc[requirements["req_id"] == x, "title"].iloc[0])
+        journey_decision = st.text_area("Journey decision", placeholder="Where is this requirement handled in the journey?")
+        data_decision = st.text_area("Data decision", placeholder="What data object, attributes, provenance or relationships are needed?")
+        rule_decision = st.text_area("Rule decision", placeholder="What condition, action, priority and exception apply?")
+        integration_decision = st.text_area("Integration decision", placeholder="What systems exchange data and how are errors reconciled?")
+        if st.button("Create design summary"):
+            summary = {
+                "requirement": requirements.loc[requirements["req_id"] == selected_req, "title"].iloc[0],
+                "journey": journey_decision,
+                "data": data_decision,
+                "rule": rule_decision,
+                "integration": integration_decision,
+                "review_questions": ["Is the decision testable?", "Does it reuse standard capability?", "What is the exception path?", "What could be affected elsewhere?"],
+            }
+            st.json(summary)
+    with tab3:
+        demo_goal = st.text_input("Demo outcome", "Secure approval of the high-risk routing design")
+        demo_script = st.text_area("Demo script", "Today I will show how the proposed journey separates standard and high-risk cases, preserves evidence, and prevents account setup before authorized approval...")
+        objection = st.selectbox("Stakeholder objection", ["This adds too much time", "We need more flexibility", "Why can’t the system auto-approve?", "Can we add another country now?"])
+        if st.button("Coach my demo"):
+            result = rubric_feedback("Demo Presentation", demo_script + " " + demo_goal + " " + objection)
+            st.metric("Demo score", f"{result['score']}/100", result["level"])
+            for move in result["next_moves"]:
+                st.write("•", move)
+    with tab4:
+        st.markdown("**Change actions**")
+        st.checkbox("Identify impacted roles and current-state pain points")
+        st.checkbox("Explain what changes, what stays the same and why")
+        st.checkbox("Update procedures, training and support ownership")
+        st.checkbox("Pilot with measurable adoption and quality criteria")
+        st.checkbox("Capture feedback and feed valid product gaps to engineering")
+        st.checkbox("Complete knowledge transfer and confirm operational readiness")
+        feedback = st.text_area("Constructive feedback to a junior consultant", placeholder="Observation, impact, expected standard, specific next action and support offered.")
+        if st.button("Evaluate feedback quality"):
+            result = rubric_feedback("Stakeholder Management", feedback)
+            st.metric("Feedback score", f"{result['score']}/100", result["level"])
+            for move in result["next_moves"]:
+                st.write("•", move)
+    if st.button("Complete M09 Product Consultant Command"):
+        mark_complete("M09")
+        st.success("Mission M09 recorded as complete.")
+
+elif page == "Odyssey AI Coach":
+    page_header("Odyssey AI Coach", "A voice-enabled and written practice environment that scores consulting answers, speaks feedback and assigns the next learning task.", "AI-assisted learning layer")
+    mode = st.selectbox("Practice mode", list(COACH_RUBRICS.keys()))
+    st.markdown("### Live voice practice")
+    components.html(voice_coach_html(mode), height=360, scrolling=False)
+    st.caption("The voice console uses browser speech recognition and speech synthesis. The written coach below works in every supported browser.")
+
+    st.markdown("### Written adaptive coach")
+    prompt = COACH_RUBRICS[mode]["task"]
+    st.markdown(f"<div class='mission'><b>Your task:</b> {escape(prompt)}</div>", unsafe_allow_html=True)
+    answer = st.text_area("Your response", height=220, placeholder="Respond as though you are speaking to a client or project team.")
+    if st.button("Get coaching", type="primary"):
+        built_in = rubric_feedback(mode, answer)
+        st.metric("Readiness score", f"{built_in['score']}/100", built_in["level"])
+        st.write(built_in["summary"])
+        if built_in["covered"]:
+            st.write("**Concepts demonstrated:**", ", ".join(built_in["covered"]))
+        for move in built_in["next_moves"]:
+            st.write("•", move)
+        st.info("Next task: " + built_in["next_task"])
+        enhanced = external_ai_feedback(mode, answer)
+        if enhanced:
+            st.markdown("#### Connected model feedback")
+            st.write(enhanced)
+        else:
+            st.caption("Using the built-in adaptive rubric. A private OpenAI-compatible endpoint can be connected through environment variables without changing the course experience.")
+
+elif page == "Capstone & Completion":
+    page_header("Final Expedition", "Combine journey, data, rules, integrations, Agile delivery, testing, BI and consulting leadership into one portfolio-ready implementation case.", "Mission M10")
+    st.markdown(f"### {SCENARIO['program']}")
+    st.write(SCENARIO["problem"])
+    st.markdown("**Required business outcomes**")
+    for outcome in SCENARIO["outcomes"]:
+        st.write("•", outcome)
+
+    st.markdown("### Capstone evidence checklist")
+    checklist_items = [
+        "Situation–Complication–Resolution problem statement",
+        "Stakeholder map and discovery plan",
+        "Journey with standard, high-risk and exception paths",
+        "Relational data model and field dictionary",
+        "KYC/AML rule and evidence matrix",
+        "CRM-to-onboarding-to-screening integration mapping",
+        "Agile epic, stories, acceptance criteria and sprint board",
+        "Negative, edge-case and integration test pack",
+        "BI control tower with executive interpretation",
+        "Demo script, decision log, approval and release recommendation",
+        "Change, training and knowledge-transfer plan",
+    ]
+    checked = []
+    cols = st.columns(2)
+    for i, item in enumerate(checklist_items):
+        with cols[i % 2]:
+            checked.append(st.checkbox(item, key=f"cap_{i}"))
+    completion_pct = round(100 * sum(checked) / len(checked))
+    st.progress(completion_pct / 100, text=f"Capstone evidence: {completion_pct}%")
+
+    st.markdown("### Knowledge check")
+    responses = []
+    for i, q in enumerate(QUIZ):
+        responses.append(st.radio(q["question"], q["options"], index=None, key=f"quiz_{i}"))
+    if st.button("Score knowledge check"):
+        score = 0
+        for response, q in zip(responses, QUIZ):
+            if response is not None and q["options"].index(response) == q["answer"]:
+                score += 1
+        st.session_state.quiz_score = score
+        st.metric("Knowledge check", f"{score}/{len(QUIZ)}")
+        for q in QUIZ:
+            st.caption(q["explanation"])
+
+    st.markdown("### Completion record")
+    learner_name = st.text_input("Learner name", "Natalie Frost")
+    eligible = completion_pct == 100 and st.session_state.quiz_score is not None and st.session_state.quiz_score >= 3
+    if eligible:
+        if st.button("Complete M10 Final Expedition"):
+            mark_complete("M10")
+            st.success("Mission M10 recorded as complete.")
+        certificate = f"""<!doctype html><html><head><meta charset='utf-8'><style>body{{font-family:Arial;background:#07172d;padding:60px}}.cert{{background:white;border:12px solid #0f766e;padding:70px;text-align:center}}h1{{font-size:44px;color:#10233f}}h2{{font-size:32px;color:#0f766e}}p{{font-size:18px;line-height:1.6}}</style></head><body><div class='cert'><div>REGOPS ODYSSEY</div><h1>Completion Record</h1><p>This recognizes</p><h2>{escape(learner_name)}</h2><p>for completing the RegOps Odyssey Product Consulting learning experience and demonstrating foundational capability in Agile delivery, financial-services onboarding, KYC/AML, SQL, BI, integrations, SaaS configuration, testing and product consulting.</p><p><b>Date:</b> {date.today().strftime('%B %d, %Y')}</p><p><small>Training completion record; not a regulated professional certification.</small></p></div></body></html>"""
+        st.download_button("Download completion record", certificate.encode("utf-8"), "RegOps_Odyssey_Completion_Record.html", "text/html")
+    else:
+        st.warning("Complete every capstone evidence item and score at least 3/4 on the knowledge check to unlock the completion record.")
+
+elif page == "Revenue Launchpad":
+    page_header("Revenue Launchpad", "Convert the training environment into a lead generator, self-paced product, guided cohort and team enablement offer.", "Monetization system")
+    st.markdown("### Offer ladder")
+    cols = st.columns(4)
+    env_urls = {
+        "Explorer": "",
+        "Career Pass": os.getenv("CAREER_PASS_URL", ""),
+        "Consultant Lab": os.getenv("CONSULTANT_LAB_URL", ""),
+        "Guided Cohort": os.getenv("COHORT_URL", ""),
+    }
+    for col, tier in zip(cols, PRICING):
+        with col:
+            items = "".join(f"<li>{escape(x)}</li>" for x in tier["includes"])
+            st.markdown(f"<div class='card'><h3>{tier['name']}</h3><div style='font-size:1.8rem;font-weight:900'>{tier['price']}</div><p class='small'>{tier['audience']}</p><ul>{items}</ul></div>", unsafe_allow_html=True)
+            if env_urls[tier["name"]]:
+                st.link_button(tier["cta"], env_urls[tier["name"]], use_container_width=True)
+            else:
+                st.button(tier["cta"], key=f"tier_{tier['name']}", use_container_width=True, disabled=tier["name"] != "Explorer")
+
+    st.markdown("### Lead capture")
+    with st.form("lead_form"):
+        c1, c2 = st.columns(2)
+        name = c1.text_input("Name")
+        email = c2.text_input("Email")
+        interest = st.selectbox("Primary interest", ["Free exploration", "Career Pass", "Consultant Lab", "Guided Cohort", "Team license"])
+        submitted = st.form_submit_button("Join the learning list", type="primary")
+        if submitted:
+            if not name.strip() or not safe_email(email):
+                st.error("Enter a name and valid email address.")
+            else:
+                save_lead(name, email, interest)
+                st.success("Interest recorded in the local training database.")
+
+    st.markdown("### Revenue design")
+    revenue_df = pd.DataFrame(
+        [
+            ("Self-paced sales", "Career Pass and Consultant Lab", "Automated", "Course unlock + templates"),
+            ("Cohorts", "Four-week guided implementation lab", "Monthly or quarterly", "Live sessions + capstone review"),
+            ("Career services", "Portfolio critique and mock demonstration", "Add-on", "Individual feedback"),
+            ("Teams", "Banks, consultancies, nonprofits and workforce programs", "Annual / cohort", "Private cohort + reporting"),
+            ("Sponsorship", "Fintech, training or recruiting partners", "Campaign", "Branded challenge without changing curriculum integrity"),
+        ],
+        columns=["Revenue stream", "Offer", "Cadence", "Value"],
+    )
+    st.dataframe(revenue_df, use_container_width=True, hide_index=True)
+
+    st.markdown("### Launch sequence")
+    launch = pd.DataFrame(
+        [
+            ("Week 1", "Deploy free app, connect checkout URLs, add privacy/terms, publish one free mission."),
+            ("Week 2", "Invite 10–20 founding learners, observe friction, collect testimonials and improve instructions."),
+            ("Week 3", "Open Career Pass and Consultant Lab; post one SQL, BI or onboarding challenge each week."),
+            ("Week 4", "Run the first guided cohort and convert the strongest capstones into permission-based case-study examples."),
+            ("Month 2+", "Pitch workforce programs, community organizations and small consultancies on team access and facilitated cohorts."),
+        ],
+        columns=["Timing", "Action"],
+    )
+    st.dataframe(launch, use_container_width=True, hide_index=True)
+    st.caption("Payment processing, taxes, consumer disclosures and access control must be configured before paid public launch.")
+
+    with st.expander("Local admin — training leads"):
+        leads = read_table("leads")
+        st.dataframe(leads, use_container_width=True, hide_index=True)
+        if not leads.empty:
+            st.download_button("Export leads", leads.to_csv(index=False).encode("utf-8"), "regops_odyssey_leads.csv", "text/csv")
+        if st.button("Reset all fictional demo data"):
+            reset_demo()
+            st.success("Demo database reset.")
+
+elif page == "Glossary & Resources":
+    page_header("Glossary & Resources", "Foundational terms, practice tools and responsible-use boundaries for the learning environment.")
+    for term, definition in GLOSSARY.items():
+        st.markdown(f"**{term}:** {definition}")
+    st.markdown("### Free-tool operating model")
+    tools = pd.DataFrame(
+        [
+            ("Streamlit Community Cloud", "Host the public learning application", "Core deployment"),
+            ("GitHub", "Version control, public portfolio and deployment source", "Core delivery"),
+            ("SQLite", "Embedded fictional training database", "Core data lab"),
+            ("Plotly", "Interactive BI visualizations", "Core reporting"),
+            ("Browser Web Speech APIs", "Live speech recognition and spoken feedback where supported", "Core voice practice"),
+            ("Azure Boards / Trello", "Optional external Agile practice", "Extension"),
+            ("Airtable", "Optional no-code compliance and workflow exercise", "Extension"),
+            ("OpenAI-compatible model endpoint", "Optional generative coaching enhancement", "Bring your own endpoint"),
+        ],
+        columns=["Tool", "Role", "Use"],
+    )
+    st.dataframe(tools, use_container_width=True, hide_index=True)
+    st.markdown("### Responsible-use boundaries")
+    st.markdown(
+        """
+- All clients, transactions, risks and alerts in this program are fictional.
+- The platform teaches transferable product-consulting and configuration concepts; it does not provide access to proprietary Fenergo or Kaha systems, training, data or certification.
+- KYC/AML exercises are educational and do not replace legal, regulatory, compliance or financial-crime advice.
+- A potential screening match is treated as an alert for authorized investigation, never as proof of wrongdoing.
+- Do not place real client, identity, financial, confidential or regulated data into a public training deployment.
+        """
+    )
+
+"""Adaptive coaching logic for RegOps Odyssey."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import urllib.error
+import urllib.request
+from typing import Any
+
+from content import COACH_RUBRICS
+
+
+def _sentence_count(text: str) -> int:
+    return len([s for s in re.split(r"[.!?]+", text) if s.strip()])
+
+
+def rubric_feedback(mode: str, response: str) -> dict[str, Any]:
+    rubric = COACH_RUBRICS[mode]
+    cleaned = response.strip()
+    lower = cleaned.lower()
+    hits = [k for k in rubric["keywords"] if k in lower]
+    missing = [k for k in rubric["keywords"] if k not in lower]
+    length_score = min(25, max(0, len(cleaned.split()) // 4))
+    coverage_score = round(55 * len(hits) / max(1, len(rubric["keywords"])))
+    structure_score = 20 if _sentence_count(cleaned) >= 3 else 10 if _sentence_count(cleaned) >= 2 else 4
+    score = min(100, length_score + coverage_score + structure_score)
+
+    if score >= 85:
+        level = "Client-ready"
+        summary = "Your answer is structured, specific, and close to a client-facing standard."
+    elif score >= 65:
+        level = "Developing consultant"
+        summary = "Your answer has a sound direction but needs sharper evidence, decisions, or measurable detail."
+    else:
+        level = "Practice needed"
+        summary = "Your answer needs more structure and clearer consulting logic before it is ready to present."
+
+    next_moves = []
+    if len(cleaned.split()) < 70:
+        next_moves.append("Add enough context to show the problem, analysis, decision, and expected outcome.")
+    if missing:
+        next_moves.append("Strengthen the answer with: " + ", ".join(missing[:4]) + ".")
+    if not any(token in lower for token in ["because", "so that", "therefore", "which means"]):
+        next_moves.append("Explain why the recommendation matters, not only what should be done.")
+    if not any(char.isdigit() for char in cleaned):
+        next_moves.append("Add at least one measurable threshold, timeframe, SLA, or acceptance criterion.")
+    if not next_moves:
+        next_moves.append("Practice delivering the same answer in 90 seconds without losing the decision or evidence.")
+
+    return {
+        "score": score,
+        "level": level,
+        "summary": summary,
+        "covered": hits,
+        "missing": missing,
+        "next_moves": next_moves[:3],
+        "next_task": rubric["task"],
+        "source": "Built-in adaptive rubric",
+    }
+
+
+def external_ai_feedback(mode: str, response: str) -> str | None:
+    """Call an optional OpenAI-compatible endpoint configured by environment variables.
+
+    Required variables: AI_API_URL, AI_API_KEY, AI_MODEL. The app remains fully usable
+    without them and falls back to rubric_feedback.
+    """
+    api_url = os.getenv("AI_API_URL", "").strip()
+    api_key = os.getenv("AI_API_KEY", "").strip()
+    model = os.getenv("AI_MODEL", "").strip()
+    if not (api_url and api_key and model):
+        return None
+
+    prompt = (
+        "You are Odyssey Coach, a financial-services product consulting trainer. "
+        f"Evaluate this learner response for the skill mode '{mode}'. "
+        "Give concise feedback under four headings: Strength, Risk, Improvement, Next Practice Task. "
+        "Do not provide legal advice and do not claim access to proprietary Fenergo configuration.\n\n"
+        f"Learner response:\n{response}"
+    )
+    payload = json.dumps(
+        {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "Coach product consultants using practical, measurable, respectful feedback."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.3,
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        api_url,
+        data=payload,
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response_obj:
+            data = json.loads(response_obj.read().decode("utf-8"))
+        return data["choices"][0]["message"]["content"]
+    except (urllib.error.URLError, urllib.error.HTTPError, KeyError, IndexError, json.JSONDecodeError, TimeoutError):
+        return None
+
+
+def voice_coach_html(mode: str) -> str:
+    keywords = COACH_RUBRICS[mode]["keywords"]
+    keyword_json = json.dumps(keywords)
+    safe_mode = mode.replace("'", "")
+    return f"""
+<!doctype html>
+<html>
+<head>
+<style>
+body {{ font-family: Arial, sans-serif; background:#07172d; color:#eef6ff; padding:18px; border-radius:14px; }}
+button {{ border:0; border-radius:10px; padding:10px 14px; margin-right:8px; cursor:pointer; font-weight:700; }}
+#start {{ background:#2dd4bf; color:#06211e; }} #stop {{ background:#f7c66a; color:#2b1a00; }} #speak {{ background:#9ec5ff; color:#07172d; }}
+#transcript {{ min-height:92px; background:#10284b; padding:12px; border-radius:10px; margin:12px 0; line-height:1.5; }}
+#feedback {{ background:#0c213e; border-left:4px solid #2dd4bf; padding:12px; border-radius:8px; }}
+.small {{ color:#b7c8df; font-size:13px; }}
+</style>
+</head>
+<body>
+<h3>🎙️ Odyssey Live Voice Coach — {safe_mode}</h3>
+<p class="small">Works best in Chrome or Edge. Your speech is processed by the browser speech service available on your device.</p>
+<button id="start">Start listening</button><button id="stop">Stop</button><button id="speak">Speak feedback</button>
+<div id="transcript">Your transcript will appear here…</div>
+<div id="feedback">Speak for at least 30 seconds to receive live feedback.</div>
+<script>
+const keywords = {keyword_json};
+let transcript = '';
+let feedbackText = '';
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+function assess(text) {{
+  const lower = text.toLowerCase();
+  const hits = keywords.filter(k => lower.includes(k));
+  const missing = keywords.filter(k => !lower.includes(k));
+  const words = text.trim().split(/\\s+/).filter(Boolean).length;
+  const score = Math.min(100, Math.round((hits.length / keywords.length) * 65 + Math.min(35, words / 2)));
+  let level = score >= 85 ? 'Client-ready' : score >= 65 ? 'Developing consultant' : 'Practice needed';
+  feedbackText = `${{level}} — score ${{score}}/100. You covered ${{hits.length ? hits.join(', ') : 'no target concepts yet'}}. ` +
+    `${{missing.length ? 'Next, add ' + missing.slice(0,3).join(', ') + '.' : 'Now make the answer more concise and measurable.'}}`;
+  document.getElementById('feedback').innerText = feedbackText;
+}}
+if (!SpeechRecognition) {{
+  document.getElementById('feedback').innerText = 'Speech recognition is not available in this browser. Use the written coach below.';
+  document.getElementById('start').disabled = true;
+}} else {{
+  recognition = new SpeechRecognition();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = 'en-US';
+  recognition.onresult = (event) => {{
+    let interim = '';
+    for (let i = event.resultIndex; i < event.results.length; i++) {{
+      const value = event.results[i][0].transcript;
+      if (event.results[i].isFinal) transcript += value + ' '; else interim += value;
+    }}
+    document.getElementById('transcript').innerText = transcript + interim;
+    assess(transcript + interim);
+  }};
+}}
+document.getElementById('start').onclick = () => {{ transcript=''; recognition && recognition.start(); }};
+document.getElementById('stop').onclick = () => {{ recognition && recognition.stop(); }};
+document.getElementById('speak').onclick = () => {{
+  if (!feedbackText) return;
+  window.speechSynthesis.cancel();
+  const utterance = new SpeechSynthesisUtterance(feedbackText);
+  utterance.rate = 0.95;
+  window.speechSynthesis.speak(utterance);
+}};
+</script>
+</body>
+</html>
+"""
+
+"""Curriculum and scenario content for RegOps Odyssey."""
+
+from __future__ import annotations
+
+CURRICULUM = [
+    {
+        "id": "M01",
+        "title": "Agile Launch Bay",
+        "duration": "1–2 hours",
+        "level": "Foundation",
+        "mission": "Turn a vague onboarding problem into a sprint-ready backlog.",
+        "skills": ["Agile delivery", "User stories", "Acceptance criteria", "ALM hygiene", "Scope control"],
+        "segments": [
+            ("Briefing", "Learn Scrum roles, ceremonies, Definition of Ready, Definition of Done, and how product consultants work with delivery teams."),
+            ("Build", "Break an institutional account-opening request into an epic, capabilities, user stories, tasks, dependencies, and measurable acceptance criteria."),
+            ("Adventure", "The Scope Storm: three stakeholders add conflicting requirements midway through the sprint. Decide what enters the sprint, backlog, or change request."),
+            ("Proof", "Create a sprint board and explain the tradeoffs in a two-minute stand-up."),
+        ],
+        "deliverable": "A prioritized onboarding backlog with at least six user stories, acceptance criteria, owners, dependencies, and story points.",
+    },
+    {
+        "id": "M02",
+        "title": "Financial Services Expedition",
+        "duration": "2–3 hours",
+        "level": "Foundation",
+        "mission": "Understand the people, products, controls, and outcomes inside institutional client onboarding.",
+        "skills": ["Financial services processes", "Products", "Operating model", "Client lifecycle", "Control points"],
+        "segments": [
+            ("Briefing", "Map prospecting, client acceptance, KYC, product suitability, approvals, account opening, maintenance, periodic review, and offboarding."),
+            ("Build", "Compare onboarding requirements for a natural person, private company, listed company, trust, and fund."),
+            ("Adventure", "Product Passport: route one client through current account, secured lending, investment, and treasury products while identifying shared and product-specific evidence."),
+            ("Proof", "Produce a lifecycle map showing teams, handoffs, systems, decision points, evidence, and business outcomes."),
+        ],
+        "deliverable": "A client lifecycle blueprint with product, team, evidence, risk, and decision overlays.",
+    },
+    {
+        "id": "M03",
+        "title": "KYC & AML Investigation",
+        "duration": "2–3 hours",
+        "level": "Core",
+        "mission": "Investigate a high-risk client and design a defensible due-diligence route.",
+        "skills": ["KYC", "AML", "CDD/EDD", "UBO", "PEP and sanctions", "Risk-based controls"],
+        "segments": [
+            ("Briefing", "Learn identity verification, ownership and control, source of funds/wealth, screening, risk scoring, periodic review, evidence and auditability."),
+            ("Build", "Create a rule matrix that determines required data, documents, screenings, approvals, and review frequency by client type, product, jurisdiction, and risk."),
+            ("Adventure", "The Red Flag Room: resolve a possible PEP match, a layered ownership chain, an expiring registration document, and a high-risk jurisdiction alert."),
+            ("Proof", "Write a recommendation explaining what can be automated, what requires human judgment, and what must block onboarding."),
+        ],
+        "deliverable": "A KYC/AML decision table, evidence checklist, risk rationale, and escalation route.",
+    },
+    {
+        "id": "M04",
+        "title": "SQL Data Vault",
+        "duration": "2–3 hours",
+        "level": "Core",
+        "mission": "Use SQL to expose onboarding delays, control gaps, and revenue blockers.",
+        "skills": ["Relational databases", "SQL", "Joins", "Aggregations", "Data quality", "Reporting logic"],
+        "segments": [
+            ("Briefing", "Learn tables, keys, relationships, cardinality, normalization, joins, filters, CASE statements, CTEs, window functions, and data-quality checks."),
+            ("Build", "Query fictional clients, products, documents, journeys, transactions, tasks, and integrations."),
+            ("Adventure", "The Missing Evidence Heist: identify high-risk clients whose journeys are open, documents are missing, and SLA exposure is increasing."),
+            ("Proof", "Write five reusable queries and translate each result into a business decision."),
+        ],
+        "deliverable": "A SQL evidence pack with query logic, output, interpretation, and recommended action.",
+    },
+    {
+        "id": "M05",
+        "title": "BI Control Tower",
+        "duration": "2–3 hours",
+        "level": "Core",
+        "mission": "Build a leadership view of onboarding speed, quality, risk, workload, and integration health.",
+        "skills": ["BI", "KPIs", "Dashboard design", "Root-cause analysis", "Executive storytelling"],
+        "segments": [
+            ("Briefing", "Define leading and lagging indicators, metric ownership, denominators, thresholds, targets, and drill-down paths."),
+            ("Build", "Create KPI cards and visuals for cycle time, SLA breaches, high-risk population, missing documents, rework, backlog, and integration failures."),
+            ("Adventure", "Signal Hunt: find the hidden cause of a regional cycle-time spike without blaming the busiest team."),
+            ("Proof", "Deliver a three-minute executive readout using Situation–Complication–Resolution."),
+        ],
+        "deliverable": "An interactive control tower plus a one-page executive interpretation.",
+    },
+    {
+        "id": "M06",
+        "title": "Integration Bridge",
+        "duration": "2–3 hours",
+        "level": "Core",
+        "mission": "Design and test a resilient CRM-to-CLM-to-screening-to-reporting integration.",
+        "skills": ["APIs", "JSON", "Field mapping", "Error handling", "Idempotency", "Cross-system integration"],
+        "segments": [
+            ("Briefing", "Learn source/target mapping, API contracts, authentication concepts, event triggers, retries, correlation IDs, reconciliation, and exception queues."),
+            ("Build", "Map a Dynamics-style client record into an onboarding case and downstream screening request."),
+            ("Adventure", "Bridge Collapse: repair duplicate messages, missing country codes, invalid product identifiers, timeout retries, and partial updates."),
+            ("Proof", "Present the integration sequence, control points, failure handling, and operational ownership."),
+        ],
+        "deliverable": "A field-mapping workbook, sample JSON payload, validation rules, error catalogue, and sequence diagram.",
+    },
+    {
+        "id": "M07",
+        "title": "Configuration Forge",
+        "duration": "2–3 hours",
+        "level": "Advanced",
+        "mission": "Configure an original SaaS onboarding environment without creating tenant conflicts or brittle rules.",
+        "skills": ["Platform configuration", "Rules", "Journeys", "Data models", "Tenant practices", "Release evaluation"],
+        "segments": [
+            ("Briefing", "Learn configuration layers, naming standards, reusable components, environment separation, dependency control, versioning, migration, and rollback."),
+            ("Build", "Configure stages, tasks, documents, risk gates, approvals, statuses, and reusable rule sets for an investment account journey."),
+            ("Adventure", "The Shared Tenant Maze: two consultants edit the same component. Prevent conflict, preserve work, and establish a safe promotion path."),
+            ("Proof", "Complete a configuration review explaining reuse, resilience, dependencies, test coverage, and release readiness."),
+        ],
+        "deliverable": "A configuration design pack and tenant working agreement.",
+    },
+    {
+        "id": "M08",
+        "title": "Quality & Gap Analysis Cavern",
+        "duration": "2–3 hours",
+        "level": "Advanced",
+        "mission": "Prove the solution survives negative tests, edge cases, and unmet requirements.",
+        "skills": ["Use cases", "Negative testing", "Edge cases", "Spikes", "Gap analysis", "QA"],
+        "segments": [
+            ("Briefing", "Learn happy paths, alternate paths, exception paths, boundary tests, decision tables, traceability, defect severity, and fit-gap methods."),
+            ("Build", "Write use cases and test scenarios for missing evidence, duplicate clients, changed ownership, sanctions alerts, and rejected approvals."),
+            ("Adventure", "The Edge-Case Cavern: select a configuration, integration, process, or product workaround for six unusual scenarios."),
+            ("Proof", "Document options, outcomes, risks, recommendation, and what remains for product engineering."),
+        ],
+        "deliverable": "A fit-gap register, test pack, defect triage, and recommendation memo.",
+    },
+    {
+        "id": "M09",
+        "title": "Product Consultant Command",
+        "duration": "2–3 hours",
+        "level": "Advanced",
+        "mission": "Lead discovery, solution design, demonstrations, approvals, change, and knowledge transfer.",
+        "skills": ["Requirements", "Functional analysis", "Solution design", "Stakeholders", "Demos", "Change management", "SME leadership"],
+        "segments": [
+            ("Briefing", "Learn discovery planning, questioning, requirement quality, assumptions, scope boundaries, design authority, decision logs, approvals, and feedback loops."),
+            ("Build", "Turn client statements into testable requirements, configuration decisions, demo scripts, and release evidence."),
+            ("Adventure", "The Council of Stakeholders: Compliance wants more controls, Operations wants speed, Sales wants flexibility, and Engineering wants fewer exceptions."),
+            ("Proof", "Run a solution demonstration, manage objections, protect scope, request approval, and assign next actions."),
+        ],
+        "deliverable": "A consulting pack containing discovery notes, requirements, decision log, design summary, demo script, change plan, and approval record.",
+    },
+    {
+        "id": "M10",
+        "title": "Final Expedition: Rapid Client Onboarding",
+        "duration": "2–3 hours",
+        "level": "Capstone",
+        "mission": "Design and release a complete product solution that reduces manual onboarding work and improves time to outcome.",
+        "skills": ["Journey design", "Data modeling", "Rules", "Integrations", "BI", "Agile delivery", "Product consulting"],
+        "segments": [
+            ("Briefing", "Receive a fictional client brief for a global investment-account onboarding transformation."),
+            ("Build", "Create the journey, ERD, rule matrix, integration payload, backlog, test evidence, dashboard, and demonstration."),
+            ("Adventure", "Launch Day: respond to one regulatory change, one failed integration, one scope request, and one executive question before release approval."),
+            ("Proof", "Present the full solution in ten minutes and defend your design choices."),
+        ],
+        "deliverable": "A portfolio-ready product consulting case study proving the ability to analyze, design, configure, test, demonstrate, and release an onboarding solution.",
+    },
+]
+
+SCENARIO = {
+    "client": "NorthStar International Bank",
+    "program": "Global Investment Account Modernization",
+    "problem": (
+        "Institutional onboarding relies on disconnected CRM records, spreadsheets, email approvals, "
+        "manual KYC evidence checks, and delayed reporting. NorthStar wants a configurable SaaS journey "
+        "that reduces rekeying, exposes risk early, and gives leadership reliable operational insight."
+    ),
+    "outcomes": [
+        "Create one auditable case record across onboarding teams.",
+        "Route standard and high-risk clients through different control paths.",
+        "Reuse verified client data across products while retaining product-specific requirements.",
+        "Integrate CRM, screening, document, and reporting services.",
+        "Measure cycle time, SLA exposure, rework, missing evidence, and integration health.",
+    ],
+    "stakeholders": [
+        "Client Service", "Operations", "KYC", "Compliance", "Head of Compliance", "Risk",
+        "Technology", "Product", "Data & Reporting", "Sales / Pre-Sales", "Client Sponsor",
+    ],
+}
+
+SQL_CHALLENGES = [
+    {
+        "title": "High-risk backlog",
+        "prompt": "Find all open high-risk journeys, ordered by the greatest SLA exposure.",
+        "hint": "Join clients and journeys; filter risk_rating and status; order by days_open minus sla_days.",
+        "starter": """SELECT c.client_name, c.country, c.risk_rating, j.current_stage,\n       j.days_open, j.sla_days, (j.days_open - j.sla_days) AS days_over_sla\nFROM clients c\nJOIN journeys j ON c.client_id = j.client_id\nWHERE c.risk_rating = 'High' AND j.status = 'Open'\nORDER BY days_over_sla DESC;""",
+    },
+    {
+        "title": "Missing evidence",
+        "prompt": "Identify clients with missing or expired documents and count the evidence gaps.",
+        "hint": "Filter document status and group by client.",
+        "starter": """SELECT c.client_name, COUNT(*) AS evidence_gaps\nFROM clients c\nJOIN documents d ON c.client_id = d.client_id\nWHERE d.status IN ('Missing', 'Expired')\nGROUP BY c.client_name\nORDER BY evidence_gaps DESC;""",
+    },
+    {
+        "title": "Product complexity",
+        "prompt": "Show clients with more than one requested product and their average journey age.",
+        "hint": "Use COUNT(DISTINCT product_id), GROUP BY, and HAVING.",
+        "starter": """SELECT c.client_name, COUNT(DISTINCT cp.product_id) AS products,\n       ROUND(AVG(j.days_open), 1) AS avg_days_open\nFROM clients c\nJOIN client_products cp ON c.client_id = cp.client_id\nJOIN journeys j ON c.client_id = j.client_id\nGROUP BY c.client_name\nHAVING COUNT(DISTINCT cp.product_id) > 1\nORDER BY products DESC, avg_days_open DESC;""",
+    },
+    {
+        "title": "Integration reliability",
+        "prompt": "Calculate failure rate and average latency by source-to-target route.",
+        "hint": "Divide error_count by records_processed and protect against zero.",
+        "starter": """SELECT source_system, target_system,\n       SUM(records_processed) AS records,\n       SUM(error_count) AS errors,\n       ROUND(100.0 * SUM(error_count) / NULLIF(SUM(records_processed), 0), 2) AS failure_rate_pct,\n       ROUND(AVG(latency_ms), 0) AS avg_latency_ms\nFROM integrations\nGROUP BY source_system, target_system\nORDER BY failure_rate_pct DESC;""",
+    },
+]
+
+QUIZ = [
+    {
+        "question": "A requirement says, ‘The system should be fast.’ What is the strongest next step?",
+        "options": [
+            "Configure the fastest available workflow",
+            "Ask for a measurable response-time target, transaction volume, and conditions",
+            "Move the requirement to a future sprint",
+            "Ask Engineering to decide",
+        ],
+        "answer": 1,
+        "explanation": "The consultant must turn subjective wording into measurable, testable acceptance criteria.",
+    },
+    {
+        "question": "A client becomes high risk after a PEP match. Which design is strongest?",
+        "options": [
+            "Automatically reject every match",
+            "Ignore the match until periodic review",
+            "Pause the journey, create a review task, preserve evidence, and route to authorized approval",
+            "Ask the client to self-approve",
+        ],
+        "answer": 2,
+        "explanation": "A controlled exception path preserves evidence and routes judgment to the proper authority.",
+    },
+    {
+        "question": "Two consultants need to change the same reusable component. What tenant practice best reduces loss of work?",
+        "options": [
+            "Both edit it at the same time",
+            "Create separate undocumented copies",
+            "Assign ownership, log the change, coordinate timing, version it, and test dependencies",
+            "Wait until release day",
+        ],
+        "answer": 2,
+        "explanation": "Shared configuration needs ownership, version control, dependency awareness, and coordinated promotion.",
+    },
+    {
+        "question": "Which KPI best exposes rework rather than only workload?",
+        "options": ["Total clients", "Tasks completed", "Average number of reopened stages per journey", "Team size"],
+        "answer": 2,
+        "explanation": "Reopened stages reveal work that had to be repeated after an initial completion.",
+    },
+]
+
+COACH_RUBRICS = {
+    "Requirements": {
+        "keywords": ["actor", "need", "because", "acceptance", "measurable", "assumption", "scope", "dependency"],
+        "task": "Rewrite the requirement as a user story with three measurable acceptance criteria and one explicit assumption.",
+    },
+    "Solution Design": {
+        "keywords": ["journey", "data", "rule", "integration", "control", "exception", "audit", "reuse"],
+        "task": "Explain the proposed journey, data, rule, and integration design, including one exception path and one reusable component.",
+    },
+    "Demo Presentation": {
+        "keywords": ["outcome", "problem", "show", "evidence", "decision", "risk", "next step", "approval"],
+        "task": "Deliver a two-minute demo opening: business problem, desired outcome, what you will show, and the approval or feedback needed.",
+    },
+    "Stakeholder Management": {
+        "keywords": ["expectation", "priority", "tradeoff", "decision", "owner", "timeline", "impact", "change"],
+        "task": "Respond to a stakeholder asking for new scope during the sprint. Protect delivery while preserving the relationship.",
+    },
+    "KYC/AML Rationale": {
+        "keywords": ["identity", "ownership", "screening", "risk", "evidence", "escalation", "review", "monitoring"],
+        "task": "Explain why a client was routed to enhanced due diligence and what evidence is required before approval.",
+    },
+}
+
+PRICING = [
+    {
+        "name": "Explorer",
+        "price": "$0",
+        "audience": "Lead-generation experience",
+        "includes": ["Two starter missions", "BI dashboard preview", "Sample SQL lab", "Career pathway assessment"],
+        "cta": "Start free",
+    },
+    {
+        "name": "Career Pass",
+        "price": "$29 one-time",
+        "audience": "Independent learners",
+        "includes": ["All ten missions", "Templates", "SQL and BI labs", "Completion record", "Portfolio capstone"],
+        "cta": "Unlock the path",
+    },
+    {
+        "name": "Consultant Lab",
+        "price": "$79 one-time",
+        "audience": "Job seekers and consultants",
+        "includes": ["Career Pass", "Demo scripts", "Interview simulations", "AI coaching prompts", "Portfolio review rubric"],
+        "cta": "Build consultant proof",
+    },
+    {
+        "name": "Guided Cohort",
+        "price": "$199",
+        "audience": "Learners wanting live feedback",
+        "includes": ["Consultant Lab", "Live group sessions", "Capstone critique", "Mock client presentation", "Career positioning"],
+        "cta": "Join a cohort",
+    },
+]
+
+GLOSSARY = {
+    "CLM": "Client Lifecycle Management: coordinated management of onboarding, due diligence, maintenance, reviews, and offboarding.",
+    "KYC": "Know Your Customer: identity, ownership, purpose, risk, and evidence processes used to understand a client.",
+    "AML": "Anti-Money Laundering: controls designed to detect, assess, and respond to financial-crime risk.",
+    "CDD": "Customer Due Diligence: standard measures used to identify and assess a client.",
+    "EDD": "Enhanced Due Diligence: additional investigation and approval for higher-risk relationships.",
+    "UBO": "Ultimate Beneficial Owner: the natural person who ultimately owns or controls an entity.",
+    "ALM": "Application Lifecycle Management: planning, tracking, developing, testing, releasing, and maintaining software changes.",
+    "Spike": "A time-boxed investigation used to reduce uncertainty before committing to a solution.",
+    "Fit-gap": "An assessment of where standard platform capability meets a requirement and where a change or workaround is needed.",
+    "Tenant": "An isolated SaaS environment containing configuration, data, users, and settings for an organization or project.",
+}
+
+"""Create and interact with the fictional RegOps Odyssey training database."""
+
+from __future__ import annotations
+
+import random
+import sqlite3
+from datetime import date, timedelta
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+DB_PATH = Path(__file__).resolve().parent / "data" / "regops_odyssey.db"
+
+
+def _dater(base: date, days: int) -> str:
+    return (base + timedelta(days=days)).isoformat()
+
+
+def init_database(force: bool = False) -> Path:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if DB_PATH.exists() and not force:
+        return DB_PATH
+
+    if DB_PATH.exists():
+        DB_PATH.unlink()
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE clients (
+            client_id INTEGER PRIMARY KEY,
+            client_name TEXT NOT NULL,
+            client_type TEXT NOT NULL,
+            country TEXT NOT NULL,
+            region TEXT NOT NULL,
+            risk_rating TEXT NOT NULL,
+            pep_flag INTEGER NOT NULL,
+            sanctions_hit INTEGER NOT NULL,
+            onboarding_status TEXT NOT NULL,
+            review_date TEXT NOT NULL,
+            assigned_owner TEXT NOT NULL,
+            source_system TEXT NOT NULL,
+            created_date TEXT NOT NULL
+        );
+        CREATE TABLE products (
+            product_id INTEGER PRIMARY KEY,
+            product_name TEXT NOT NULL,
+            product_family TEXT NOT NULL,
+            risk_weight INTEGER NOT NULL
+        );
+        CREATE TABLE client_products (
+            client_product_id INTEGER PRIMARY KEY,
+            client_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            requested_date TEXT NOT NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id),
+            FOREIGN KEY(product_id) REFERENCES products(product_id)
+        );
+        CREATE TABLE documents (
+            document_id INTEGER PRIMARY KEY,
+            client_id INTEGER NOT NULL,
+            doc_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            expiry_date TEXT,
+            verified INTEGER NOT NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id)
+        );
+        CREATE TABLE journeys (
+            journey_id INTEGER PRIMARY KEY,
+            client_id INTEGER NOT NULL,
+            journey_type TEXT NOT NULL,
+            current_stage TEXT NOT NULL,
+            sla_days INTEGER NOT NULL,
+            days_open INTEGER NOT NULL,
+            high_risk_gate INTEGER NOT NULL,
+            reopened_stages INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id)
+        );
+        CREATE TABLE tasks (
+            task_id INTEGER PRIMARY KEY,
+            journey_id INTEGER NOT NULL,
+            sprint INTEGER NOT NULL,
+            owner TEXT NOT NULL,
+            task_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            story_points INTEGER NOT NULL,
+            due_date TEXT NOT NULL,
+            FOREIGN KEY(journey_id) REFERENCES journeys(journey_id)
+        );
+        CREATE TABLE transactions (
+            txn_id INTEGER PRIMARY KEY,
+            client_id INTEGER NOT NULL,
+            amount REAL NOT NULL,
+            country TEXT NOT NULL,
+            channel TEXT NOT NULL,
+            txn_date TEXT NOT NULL,
+            alert_flag INTEGER NOT NULL,
+            FOREIGN KEY(client_id) REFERENCES clients(client_id)
+        );
+        CREATE TABLE integrations (
+            integration_id INTEGER PRIMARY KEY,
+            source_system TEXT NOT NULL,
+            target_system TEXT NOT NULL,
+            object_name TEXT NOT NULL,
+            run_date TEXT NOT NULL,
+            last_status TEXT NOT NULL,
+            records_processed INTEGER NOT NULL,
+            error_count INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL
+        );
+        CREATE TABLE requirements (
+            req_id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            persona TEXT NOT NULL,
+            acceptance_criteria TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            owner TEXT NOT NULL
+        );
+        CREATE TABLE leads (
+            lead_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL,
+            interest TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    clients = [
+        (1, "Asteria Global Holdings", "Private Company", "Ireland", "EMEA", "High", 1, 0, "In Review", _dater(date.today(), 18), "Maya Chen", "Dynamics CRM", _dater(date.today(), -42)),
+        (2, "BluePeak Renewable Fund", "Fund", "Luxembourg", "EMEA", "Medium", 0, 0, "Onboarding", _dater(date.today(), 66), "Ethan Ross", "Salesforce", _dater(date.today(), -27)),
+        (3, "Cedar Ridge Manufacturing", "Private Company", "United States", "Americas", "Low", 0, 0, "Approved", _dater(date.today(), 310), "Natalie Frost", "Dynamics CRM", _dater(date.today(), -19)),
+        (4, "Delta Meridian Trust", "Trust", "United Kingdom", "EMEA", "High", 0, 1, "Escalated", _dater(date.today(), -8), "Maya Chen", "Partner Portal", _dater(date.today(), -61)),
+        (5, "Everstone Capital Partners", "Partnership", "United States", "Americas", "Medium", 0, 0, "Onboarding", _dater(date.today(), 94), "Natalie Frost", "Salesforce", _dater(date.today(), -22)),
+        (6, "Fjordline Shipping AS", "Private Company", "Norway", "EMEA", "Medium", 0, 0, "In Review", _dater(date.today(), 45), "Amina Yusuf", "Dynamics CRM", _dater(date.today(), -34)),
+        (7, "Golden Baobab Trading", "Private Company", "South Africa", "Africa", "High", 0, 0, "Onboarding", _dater(date.today(), 12), "Thabo Ndlovu", "Partner Portal", _dater(date.today(), -49)),
+        (8, "Harborlight Family Office", "Family Office", "Singapore", "APAC", "Medium", 1, 0, "In Review", _dater(date.today(), 27), "Priya Shah", "Salesforce", _dater(date.today(), -37)),
+        (9, "Ionix Payments Ltd", "Fintech", "Ireland", "EMEA", "Low", 0, 0, "Approved", _dater(date.today(), 350), "Ethan Ross", "Dynamics CRM", _dater(date.today(), -15)),
+        (10, "Juniper Municipal Treasury", "Public Entity", "Canada", "Americas", "Low", 0, 0, "Onboarding", _dater(date.today(), 140), "Natalie Frost", "Partner Portal", _dater(date.today(), -11)),
+        (11, "Kestrel Mining Group", "Listed Company", "Australia", "APAC", "High", 0, 0, "In Review", _dater(date.today(), -3), "Priya Shah", "Dynamics CRM", _dater(date.today(), -55)),
+        (12, "Lumina Health Ventures", "Fund", "United States", "Americas", "Medium", 0, 0, "Onboarding", _dater(date.today(), 75), "Natalie Frost", "Salesforce", _dater(date.today(), -29)),
+        (13, "Mosaic Infrastructure PLC", "Listed Company", "United Kingdom", "EMEA", "Low", 0, 0, "Approved", _dater(date.today(), 280), "Amina Yusuf", "Dynamics CRM", _dater(date.today(), -21)),
+        (14, "Nile Bridge Commodities", "Private Company", "Egypt", "Africa", "High", 0, 0, "Escalated", _dater(date.today(), 5), "Thabo Ndlovu", "Partner Portal", _dater(date.today(), -72)),
+        (15, "Orchid Digital Assets", "Fintech", "Singapore", "APAC", "High", 1, 0, "In Review", _dater(date.today(), 20), "Priya Shah", "Salesforce", _dater(date.today(), -46)),
+        (16, "Prairie Community Bank", "Bank", "United States", "Americas", "Medium", 0, 0, "Onboarding", _dater(date.today(), 120), "Natalie Frost", "Dynamics CRM", _dater(date.today(), -17)),
+        (17, "Quartz Aviation Leasing", "Private Company", "Ireland", "EMEA", "Medium", 0, 0, "In Review", _dater(date.today(), 41), "Ethan Ross", "Salesforce", _dater(date.today(), -39)),
+        (18, "Redwood Pension Trustees", "Trust", "United Kingdom", "EMEA", "Low", 0, 0, "Approved", _dater(date.today(), 330), "Maya Chen", "Partner Portal", _dater(date.today(), -25)),
+    ]
+    cur.executemany("INSERT INTO clients VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", clients)
+
+    products = [
+        (1, "Institutional Investment Account", "Investments", 4),
+        (2, "Current Account", "Deposits", 2),
+        (3, "Secured Loan", "Lending", 3),
+        (4, "Unsecured Loan", "Lending", 5),
+        (5, "Treasury & FX", "Markets", 4),
+        (6, "Merchant Settlement", "Payments", 5),
+    ]
+    cur.executemany("INSERT INTO products VALUES (?,?,?,?)", products)
+
+    random.seed(14)
+    cp_id = 1
+    for client_id in range(1, 19):
+        count = random.choice([1, 1, 2, 2, 3])
+        for product_id in random.sample(range(1, 7), count):
+            cur.execute(
+                "INSERT INTO client_products VALUES (?,?,?,?,?)",
+                (cp_id, client_id, product_id, random.choice(["Requested", "In Setup", "Active"]), _dater(date.today(), -random.randint(5, 60))),
+            )
+            cp_id += 1
+
+    doc_types = ["Certificate of Incorporation", "Ownership Register", "Proof of Address", "Authorized Signatory List", "Source of Funds Evidence", "Tax Form"]
+    statuses = ["Verified", "Verified", "Verified", "Pending", "Missing", "Expired"]
+    doc_id = 1
+    for client_id in range(1, 19):
+        for doc_type in random.sample(doc_types, random.choice([3, 4, 5, 6])):
+            status = random.choice(statuses)
+            cur.execute(
+                "INSERT INTO documents VALUES (?,?,?,?,?,?)",
+                (doc_id, client_id, doc_type, status, _dater(date.today(), random.randint(-80, 500)), 1 if status == "Verified" else 0),
+            )
+            doc_id += 1
+
+    stages = ["Request Intake", "Operations Validation", "KYC Collection", "KYC Verification", "Compliance Review", "Account Setup", "Client Confirmation"]
+    journey_rows = []
+    for client_id, client in enumerate(clients, start=1):
+        # client tuple index 5 = risk, 8 = status
+        risk = client[5]
+        onboarding_status = client[8]
+        days_open = random.randint(8, 76)
+        sla = 25 if risk == "High" else 20
+        journey_rows.append((client_id, client_id, "Investment Account Onboarding", random.choice(stages), sla, days_open, 1 if risk == "High" else 0, random.randint(0, 3), "Closed" if onboarding_status == "Approved" else "Open"))
+    cur.executemany("INSERT INTO journeys VALUES (?,?,?,?,?,?,?,?,?)", journey_rows)
+
+    task_titles = [
+        ("Story", "Confirm client type and product scope"),
+        ("Task", "Map CRM fields to case data"),
+        ("Task", "Configure required-document rule"),
+        ("Task", "Create high-risk approval gate"),
+        ("Test", "Run missing-document negative test"),
+        ("Test", "Validate duplicate-client response"),
+        ("Demo", "Prepare stakeholder walkthrough"),
+    ]
+    owners = ["Natalie Frost", "Maya Chen", "Ethan Ross", "Amina Yusuf", "Priya Shah", "Thabo Ndlovu"]
+    statuses_task = ["Backlog", "Ready", "In Progress", "Review", "Done"]
+    task_id = 1
+    for journey_id in range(1, 19):
+        for task_type, title in random.sample(task_titles, random.choice([3, 4, 5])):
+            cur.execute(
+                "INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?)",
+                (task_id, journey_id, random.choice([1, 2, 3]), random.choice(owners), task_type, title, random.choice(statuses_task), random.choice([1, 2, 3, 5, 8]), _dater(date.today(), random.randint(-10, 24))),
+            )
+            task_id += 1
+
+    txn_id = 1
+    tx_countries = ["United States", "United Kingdom", "Ireland", "Singapore", "South Africa", "UAE", "Cayman Islands", "Luxembourg"]
+    for client_id in range(1, 19):
+        for _ in range(random.randint(3, 8)):
+            amount = round(random.uniform(5000, 850000), 2)
+            country = random.choice(tx_countries)
+            alert = int(amount > 600000 or country in {"UAE", "Cayman Islands"})
+            cur.execute(
+                "INSERT INTO transactions VALUES (?,?,?,?,?,?,?)",
+                (txn_id, client_id, amount, country, random.choice(["Wire", "ACH", "Card", "Internal Transfer"]), _dater(date.today(), -random.randint(1, 90)), alert),
+            )
+            txn_id += 1
+
+    integration_routes = [
+        ("Dynamics CRM", "Onboarding CLM", "Client"),
+        ("Salesforce", "Onboarding CLM", "Client"),
+        ("Partner Portal", "Onboarding CLM", "Application"),
+        ("Onboarding CLM", "Screening Service", "Party"),
+        ("Document Service", "Onboarding CLM", "Document"),
+        ("Onboarding CLM", "BI Warehouse", "Journey Event"),
+    ]
+    integration_id = 1
+    for run_offset in range(12):
+        for source, target, obj in integration_routes:
+            processed = random.randint(45, 450)
+            errors = random.randint(0, 18) if source != "Onboarding CLM" else random.randint(0, 10)
+            cur.execute(
+                "INSERT INTO integrations VALUES (?,?,?,?,?,?,?,?,?)",
+                (integration_id, source, target, obj, _dater(date.today(), -run_offset), "Failed" if errors > 12 else "Success", processed, errors, random.randint(180, 3200)),
+            )
+            integration_id += 1
+
+    requirements = [
+        (1, "Reuse verified client data across product journeys", "Operations Analyst", "Given verified data exists, when a new product is requested, then approved reusable data is prefilled and its provenance is retained.", "Must", "Approved", "Product Consultant"),
+        (2, "Route high-risk clients to Head of Compliance", "Compliance Officer", "When risk is High, the account setup stage cannot begin until Head of Compliance approval is recorded.", "Must", "In Review", "Compliance Lead"),
+        (3, "Expose missing evidence in executive reporting", "Program Sponsor", "Dashboard shows open journeys with missing or expired evidence and supports drill-down to client and document.", "Should", "Ready", "BI Lead"),
+        (4, "Prevent duplicate client creation", "KYC Analyst", "Potential duplicates are displayed before case creation using legal name, registration number, and country; authorized users can resolve the match.", "Must", "In Progress", "Integration Lead"),
+        (5, "Send client confirmation after account setup", "Client Service", "After setup succeeds, a confirmation task and approved communication are created within five minutes.", "Could", "Backlog", "Client Service Lead"),
+        (6, "Reconcile integration failures", "Technology Support", "Each failed message has a correlation ID, error category, retry status, owner, and final reconciliation result.", "Must", "Ready", "Integration Lead"),
+    ]
+    cur.executemany("INSERT INTO requirements VALUES (?,?,?,?,?,?,?)", requirements)
+
+    conn.commit()
+    conn.close()
+    return DB_PATH
+
+
+def get_connection(read_only: bool = False) -> sqlite3.Connection:
+    init_database()
+    if read_only:
+        return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, check_same_thread=False)
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def read_table(table_name: str) -> pd.DataFrame:
+    allowed = {"clients", "products", "client_products", "documents", "journeys", "tasks", "transactions", "integrations", "requirements", "leads"}
+    if table_name not in allowed:
+        raise ValueError("Unknown table")
+    with get_connection(read_only=True) as conn:
+        return pd.read_sql_query(f"SELECT * FROM {table_name}", conn)
+
+
+def execute_select(query: str) -> pd.DataFrame:
+    normalized = " ".join(query.strip().lower().split())
+    forbidden = [" insert ", " update ", " delete ", " drop ", " alter ", " create ", " replace ", " pragma ", " attach ", " detach ", " vacuum "]
+    padded = f" {normalized} "
+    if not (normalized.startswith("select") or normalized.startswith("with")):
+        raise ValueError("Only SELECT or read-only CTE queries are allowed in the learning lab.")
+    if any(word in padded for word in forbidden):
+        raise ValueError("The learning lab blocks data-changing SQL. Use SELECT statements only.")
+    with get_connection(read_only=True) as conn:
+        return pd.read_sql_query(query, conn)
+
+
+def move_task(task_id: int, new_status: str) -> None:
+    valid = {"Backlog", "Ready", "In Progress", "Review", "Done"}
+    if new_status not in valid:
+        raise ValueError("Invalid status")
+    with get_connection() as conn:
+        conn.execute("UPDATE tasks SET status = ? WHERE task_id = ?", (new_status, task_id))
+        conn.commit()
+
+
+def save_lead(name: str, email: str, interest: str) -> None:
+    with get_connection() as conn:
+        conn.execute("INSERT INTO leads(name, email, interest) VALUES (?,?,?)", (name.strip(), email.strip().lower(), interest))
+        conn.commit()
+
+
+def reset_demo() -> None:
+    init_database(force=True)
+
+
+def dashboard_data() -> dict[str, Any]:
+    with get_connection(read_only=True) as conn:
+        clients = pd.read_sql_query("SELECT * FROM clients", conn)
+        journeys = pd.read_sql_query("SELECT * FROM journeys", conn)
+        documents = pd.read_sql_query("SELECT * FROM documents", conn)
+        tasks = pd.read_sql_query("SELECT * FROM tasks", conn)
+        integrations = pd.read_sql_query("SELECT * FROM integrations", conn)
+    merged = journeys.merge(clients[["client_id", "client_name", "region", "risk_rating", "assigned_owner"]], on="client_id", how="left")
+    return {"clients": clients, "journeys": merged, "documents": documents, "tasks": tasks, "integrations": integrations}
+
+# Deploy RegOps Odyssey on Streamlit Community Cloud
+
+1. Create a GitHub repository.
+2. Upload every file and folder in this package to the repository root.
+3. Go to https://share.streamlit.io and sign in with GitHub.
+4. Click **Create app**.
+5. Choose your repository and the `main` branch.
+6. Set **Main file path** to `app.py`.
+7. Click **Deploy**.
+
+Optional environment variables can be entered in Advanced settings / Secrets:
+
+```toml
+CAREER_PASS_URL = "https://..."
+CONSULTANT_LAB_URL = "https://..."
+COHORT_URL = "https://..."
+AI_API_URL = "https://..."
+AI_API_KEY = "..."
+AI_MODEL = "..."
+```
+
+Do not commit real API keys or payment credentials to GitHub.
+
+# RegOps Odyssey — Streamlit Community Cloud Edition
+
+Upload this folder to a GitHub repository and deploy `app.py` through Streamlit Community Cloud.
+
+The app creates its fictional SQLite learning database automatically. Add optional checkout and AI endpoint secrets through Streamlit's secret settings rather than committing keys.
