@@ -1,25 +1,5 @@
-# 🎈 Blank app template
+# RegOps Odyssey — Streamlit Community Cloud Edition
 
-A simple Streamlit app template for you to modify!
+Upload this folder to a GitHub repository and deploy `app.py` through Streamlit Community Cloud.
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://blank-app-template.streamlit.app/)
-
-### How to run it on your own machine
-
-Prerequisite: install `uv` if you don't already have it.
-
-```
-$ curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-1. Sync the dependencies
-
-   ```
-   $ uv sync
-   ```
-
-2. Run the app
-
-   ```
-   $ uv run streamlit run streamlit_app.py
-   ```
+The app creates its fictional SQLite learning database automatically. Add optional checkout and AI endpoint secrets through Streamlit's secret settings rather than committing keys.
